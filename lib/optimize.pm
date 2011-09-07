@@ -6,62 +6,72 @@ use B::Generate;
 use B::Utils qw(walkallops_simple);
 use B qw(OPf_KIDS OPf_MOD OPf_PARENS OPf_WANT_SCALAR OPf_STACKED);
 use Attribute::Handlers;
-use B::Hooks::EndOfScope;
 
-our $VERSION = "0.03_03";
+our $VERSION = "0.04";
 
 our $DEBUG = 0;
 our %pads;
 our $state;
-our $old_op;
 our %loaded;
 our $stash = '';
 our %register;
 
 sub dbgprint { print @_ if $DEBUG; }
+sub B::OP::safenext { $_[0]->can('next') ? $_[0]->next : bless { next => 0 }, "B::OP" }
+
 use optimizer "extend-c" => sub {
     my $op = shift;
-    on_scope_end {$old_op = $op;()};
     return unless $op;
+
     if ($op->name eq 'nextstate') {
 	$state = $op;
 	$stash = $state->stash->NAME;
-        dbgprint $state->file . ":" . $state->line . "-" . $state->stash->NAME . "\n";
-        if ($stash =~/^(optimize|B::|types$|float$|double$|int$|number$|^O$)/) {
-            dbgprint "Don't optimize ourself\n";
+        dbgprint $state->file . ":" . $state->line . " " . $state->stash->NAME . "\n";
+        if ($stash =~ /^(optimize|B::|types$|float$|double$|int$|number$|^O$|^DB$)/) {
+            dbgprint "Don't optimize ourself $stash\n";
             return;
         }
     }
 
-    dbgprint ref($op)." - " . $op->name . " - " . ref($op->next) . " - " . 
+    dbgprint ref($op)." - " . $op->name . " -> " . ref($op->next) . " - " . 
              ($op->next->can('name') ? $op->next->name : "null") . "\n";
     my $cv;
     eval {
 	$cv = $op->find_cv;
     };
     if ($@) {
-	$@ =~s/\n//;
+	$@ =~ s/\n//;
 	print "$@ in " . $state->file . ":" . $state->line . "\n";;
 	return;
     }
-    if ($op->name eq 'const' &&
-       ref($op->sv) eq 'B::PV' && 
-       $op->sv->sv eq 'attributes' &&
-       $op->can('next') &&
-       $op->next->can('next') &&
-       $op->next->next->can('next') &&
-       $op->next->next->next->can('next') &&
-       $op->next->next->next->next->can('next') &&
-       $op->next->next->next->next->next->can('next') &&
-       $op->next->next->next->next->next->next &&
-       $op->next->next->next->next->next->next->name eq 'method_named' &&
-       $op->next->next->next->next->next->next->sv->sv eq 'import')
-    {
+
+    # $DB::single = 1 if defined &DB::DB;
+    # const $foo with attributes:
+    # pb -MO=Concise,-exec -e'my $foo : optimize(int) = 1.5;'
+    # pb -MO=Deparse -e'my $foo : optimize(int) = 1.5;'
+    #   ('attributes'->import('main', \$foo, 'optimize(int)'), my $foo) = 1.5;
+    dbgprint "sv: ",ref($op->sv),"\n" if $op->name eq 'const';
+    if ($op->name eq 'const' && 				
+	ref($op->sv) =~ /^B::(P|G)V$/ 	# GV threaded, PV not-threaded
+       )  
+    { 
+	#dbgprint "const: ",$op->sv->sv,"\n";
+	if ($op->next->next->name eq 'padsv') {
+	    #dbgprint "padsv ->",
+	    #  $op->next->next->next,"->",$op->next->next->next->next->name, "\n";
+	    if ($op->next->next->next->next->name eq 'srefgen') {
+		#dbgprint "srefgen ->", $op->next->next->next->next->next->name, "\n";
+		if ($op->next->next->next->next->next->name eq 'const') {
+		    #dbgprint "const ->", $op->next->next->next->next->next->name, "\n";
+		    if ($op->next->next->next->next->next->next->name eq 'method_named') {
+			#dbgprint "method: ", $op->next->next->next->next->next->next->name,":", 
+			#  $op->next->next->next->next->next->next->sv->sv, "\n";
+			if ($op->next->next->next->next->next->next->sv->sv eq 'import') {
 
         # Here we establish that this is an use of attributes on lexicals
         # however we want to establish what attribute it is
-	
 	my $attribute = $op->next->next->next->next->next->sv->sv;
+	dbgprint "my const $attribute\n"; # fails threaded
 	
 	if ($attribute =~/^optimize\(\s*(.*)\s*\)/) {
             #dbgprint "attr: $attribute\n";
@@ -80,19 +90,22 @@ use optimizer "extend-c" => sub {
 		}
 	    }
 	}
+			}
+		    }
+		}
+	    }
+	}
     }
 
     for (values %loaded) {	
-        dbgprint "Calling $_\n";
+        dbgprint "$_->check ",$op->name,"\n";
 	$_->check($op);
-        dbgprint "Called $_\n";
+        #dbgprint "Called $_\n";
     }
     # calling types
     if (exists($register{$stash})) {
 	for my $callback (values %{$register{$stash}}) {
-	    if ($callback) {
-		$callback->($op);
-	    }
+	    $callback->($op) if $callback;
 	}
     }
 
@@ -103,6 +116,7 @@ sub register {
     my $callback = shift;
     my $package = shift;
     my ($name) = (caller)[0];
+    #$DB::single = 1 if defined &DB::DB; # magic to allow debugging into CHECK blocks
     $register{$package}->{$name} = $callback;
 }
 
